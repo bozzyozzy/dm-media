@@ -1,0 +1,69 @@
+name: Sync DM main media
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "dm-main-clips.json"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-dm-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ffmpeg jq python3-pip
+          pip3 install --quiet gdown
+
+      - name: Pull Drive clips, normalize to repo root
+        run: |
+          set -e
+          count=$(jq length dm-main-clips.json)
+          for i in $(seq 0 $((count - 1))); do
+            id=$(jq -r ".[$i].id" dm-main-clips.json)
+            base=$(jq -r ".[$i].name" dm-main-clips.json)
+            out="./$base.mp4"
+            if [ -f "$out" ]; then echo "skip existing $out"; continue; fi
+            echo "=== $base ($id) ==="
+            rm -f in.bin
+            gdown "$id" -O in.bin --no-cookies || { echo "download failed: $base"; continue; }
+            if ! ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 in.bin >/tmp/codec 2>/dev/null; then
+              echo "not a video / bad download: $base"; continue
+            fi
+            codec=$(cat /tmp/codec)
+            echo "codec=$codec"
+            case "$codec" in
+              h264|avc1)
+                ffmpeg -nostdin -y -i in.bin -c copy -movflags +faststart "$out" || \
+                ffmpeg -nostdin -y -i in.bin -c:v libx264 -crf 21 -preset fast -maxrate 10M -bufsize 20M -pix_fmt yuv420p -c:a aac -b:a 160k -movflags +faststart "$out"
+                ;;
+              *)
+                ffmpeg -nostdin -y -i in.bin -c:v libx264 -crf 21 -preset fast -maxrate 10M -bufsize 20M -pix_fmt yuv420p -c:a aac -b:a 160k -movflags +faststart "$out"
+                ;;
+            esac
+            rm -f in.bin
+          done
+
+      - name: Commit and push
+        run: |
+          rm -f in.bin
+          git config user.name "BeeBigger Bot"
+          git config user.email "info@beebigger.com"
+          jq -r '.[].name' dm-main-clips.json | while read n; do [ -f "$n.mp4" ] && git add -- "$n.mp4"; done
+          if git diff --staged --quiet; then
+            echo "No new media to commit."
+          else
+            git commit -m "sync: dm-main reels $(date -u +%Y-%m-%dT%H:%MZ)"
+            git push
+          fi
